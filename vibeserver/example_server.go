@@ -80,6 +80,14 @@ func (serv myServerListener) Socket(s *vibe.VibeSocket) {
     s.Listener = ms
 }
 
+func (serv myServerListener) Auth(req *http.Request) bool {
+    return true
+}
+
+func (serv myServerListener) Log(format string, args... interface{}) {
+    log.Printf(format, args...)
+}
+
 type mySocketListener struct {
     socket      *vibe.VibeSocket
 }
