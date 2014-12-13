@@ -64,6 +64,9 @@ var (
 type ServerListener interface {
     // Socket gets called when a new socket has been opened
     Socket(s *VibeSocket)
+
+    // authorizes the request. Return false to deny the request.
+    Auth(req *http.Request) bool
 }
 
 type SocketListener interface {
@@ -186,6 +189,11 @@ func (serv *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
     params := req.URL.Query()
 
+    if !serv.Listener.Auth(req) {
+        http.Error(w, "Not Authorized", 403)
+        return
+    }
+
     log.Println("vibe.Server.ServeHttp: ", req.Method, ":", req.URL.RequestURI())
 
     switch strings.ToUpper(req.Method) {
@@ -197,7 +205,6 @@ func (serv *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
                     defer req.Body.Close()
                     // A result of handshaking is a JSON containing that
                     // information.
-                    log.Println("Transports:", serv.transports)
                     res := handshakeResult{
                         Id: uuid.New(),
                         Transports: serv.transports,
