@@ -90,7 +90,7 @@ func (serv mySocketListener) Error(err error) {
 func (serv mySocketListener) Close() {
     log.Println("Close!")
 }
-func (serv mySocketListener) Messsage(t string, d interface{}) {
+func (serv mySocketListener) Message(t string, d interface{}) {
     log.Println("Message!", t, d)
     if t == "echo" {
         serv.socket.Send("echo", d, nil)

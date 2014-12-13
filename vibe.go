@@ -22,13 +22,12 @@ import (
     "bytes"
     "net/url"
     "strconv"
-    "bufio"
     "net"
     "fmt"
     "log"
     "errors"
-    "net/http/httputil"
     "sync"
+    "github.com/gorilla/websocket"
 )
 
 
@@ -50,7 +49,7 @@ const (
 
 var (
     AllTransports = []TransportType{
-        //Ws,
+        Ws,
         Sse,
         StreamXhr,
         StreamXdr,
@@ -73,7 +72,7 @@ type SocketListener interface {
     // Socket was closed
     Close()
     // A new message arrived from the client
-    Messsage(messageType string, data interface{})
+    Message(messageType string, data interface{})
     // The client is requiring a reply to this message
     ReplyMessage(messageType string, data interface{}, replyWith func (resolve bool, value interface{}))
 }
@@ -107,6 +106,7 @@ type VibeSocket struct {
     // our parent Server
     Server          *Server
     heartbeatTimer  *time.Timer
+
 }
 
 // When we get a reply, this will called
@@ -116,13 +116,13 @@ type SocketCallback func(resolve bool, value interface{})
 
 // Creates a new server
 //  transports - a set of supported transports to be used by a client. If nil then all used.
-//  heartbeat - interval in milliseconds for heartbeat. If 0 then 2 seconds is used.
+//  heartbeat - interval in milliseconds for heartbeat. If 0 then 20 seconds is used.
 func NewServer(transports []TransportType, heartbeat time.Duration) *Server {
     s := new(Server)
     s.heartbeat = int64(heartbeat)
     s.transports = transports
     if s.heartbeat == 0 {
-        s.heartbeat = int64((2 * time.Second) / time.Millisecond)
+        s.heartbeat = int64((20 * time.Second) / time.Millisecond)
     }
     if len(s.transports) == 0 {
         s.transports = AllTransports
@@ -161,7 +161,7 @@ func (serv *Server) SetTransports(t []TransportType) {
 func (serv *Server) SetHeartbeat(t time.Duration) {
     serv.heartbeat = int64(t / time.Millisecond)
     if serv.heartbeat == 0 {
-        serv.heartbeat = int64((2 * time.Second) / time.Millisecond)
+        serv.heartbeat = int64((20 * time.Second) / time.Millisecond)
     }
 }
 
@@ -221,11 +221,11 @@ func (serv *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
                 // `socket` event. `transportInt` param is an id of transportInt the
                 // client uses.
                 case "open":
+                    defer req.Body.Close()
                     // If the server doesn't support the required transportInt,
                     // responds with `501 Not Implemented`. However, it's 
                     // unlikely to happen.
                     if !serv.supportsTransport(params.Get("transport")) {
-                        defer req.Body.Close()
                         w.WriteHeader(501)
                         return
                     }
@@ -234,14 +234,17 @@ func (serv *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
                     if serv.Listener != nil {
                         serv.Listener.Socket(s)
                     }
+                    s.transport.Wait()
                     break
                 // Inject a new exchange of request and response to the long polling
                 // transportInt of the socket whose id is `id` param. In long polling,
                 // a pseudo-connection consisting of disposable exchanges pretends
                 // to be a persistent connection.
                 case "poll":
+                    defer req.Body.Close()
                     if s, ok := serv.sockets[params.Get("id")]; ok {
                         s.transport.Refresh(w, req, params)
+                        s.transport.Wait()
                     } else {
                         // If there is no corresponding socket, responds with `500
                         // Internal Server Error`.
@@ -321,7 +324,7 @@ func (serv *Server) createTransport(w http.ResponseWriter, req *http.Request, pa
     case "longpollajax":
         return newLongPollAjax(w, req, params)
     case "ws":
-        fallthrough
+        return newWebsocketTransport(w, req, params)
     default:
         w.WriteHeader(401)
         req.Body.Close()
@@ -330,7 +333,86 @@ func (serv *Server) createTransport(w http.ResponseWriter, req *http.Request, pa
 }
 
 
+var upgrader = websocket.Upgrader{
+    ReadBufferSize:  1024,
+    WriteBufferSize: 1024,
+    CheckOrigin: func (r *http.Request) bool {return true},
+}
+
 // TODO: websockets upgrade
+type websocketTransport struct {
+    conn            *websocket.Conn
+    writeQueue      chan []byte
+    closedLock      sync.Mutex
+    closed          bool
+    listener        transportListener
+}
+
+func newWebsocketTransport(w http.ResponseWriter, req *http.Request, params url.Values) *websocketTransport {
+    conn, err := upgrader.Upgrade(w, req, nil)
+    if err != nil {
+        panic(err)
+    }
+    ws := &websocketTransport{
+        conn: conn,
+        writeQueue: make(chan []byte),
+    }
+    go ws.Read()
+    return ws
+}
+
+func (w *websocketTransport) Send(data []byte) {
+    w.closedLock.Lock()
+    defer w.closedLock.Unlock()
+    if w.closed {
+        return
+    }
+    w.writeQueue <- data
+}
+func (w *websocketTransport) Close() {
+    w.closedLock.Lock()
+    defer w.closedLock.Unlock()
+    if w.closed {
+        return
+    }
+    w.closed = true
+    close(w.writeQueue)
+    w.conn.Close()
+    w.listener.OnTransportClose()
+}
+func (w *websocketTransport) SetListener(l transportListener) {
+    w.listener = l
+}
+func (w *websocketTransport) Refresh(wr http.ResponseWriter, req *http.Request, params url.Values) {
+    panic("not supported")
+}
+func (w *websocketTransport) Read() {
+    for {
+        typ, p, err := w.conn.ReadMessage()
+        if err != nil {
+            // closed
+            w.Close()
+            return
+        }
+        if typ != websocket.TextMessage {
+            fmt.Println("Message: ", typ, string(p))
+            continue
+        }
+        w.listener.OnTransportMessage(string(p))
+    }
+}
+func (w *websocketTransport) Wait() {
+    for {
+        msg, ok := <- w.writeQueue
+        if !ok {
+            return
+        }
+        err := w.conn.WriteMessage(websocket.TextMessage, msg)
+        if err != nil {
+            w.listener.OnTransportError(err)
+        }
+    }
+}
 
 
 // A socket is an interface to exchange event between the two endpoints and
@@ -381,11 +463,19 @@ func (socket *VibeSocket) OnTransportClose() {
 type Message struct {
     Id              string      `json:"id"`
     Type            string      `json:"type"`
-    Data            interface{} `json:"data"`
+    Data            interface{} `json:"data,omitempty"`
     Reply           *bool       `json:"reply,omitempty"`
     Exception       *bool       `json:"exception,omitempty"`
 }
 
+// default vibe client sends Id as number... thats annoying.
+type messageWithNumberId struct {
+    Id              float64     `json:"id"`
+    Type            string      `json:"type"`
+    Data            interface{} `json:"data,omitempty"`
+    Reply           *bool       `json:"reply,omitempty"`
+    Exception       *bool       `json:"exception,omitempty"`
+}
 
 func (socket *VibeSocket) OnTransportMessage(msg string) {
     // Converts JSON to an message object.
@@ -393,19 +483,27 @@ func (socket *VibeSocket) OnTransportMessage(msg string) {
     var event Message
     err := json.Unmarshal([]byte(msg), &event)
     if err != nil {
-        return
+        var eventNum messageWithNumberId
+        if err2 := json.Unmarshal([]byte(msg), &eventNum); err2 != nil {
+            socket.Listener.Error(err)
+            return
+        }
+        event.Id = fmt.Sprintf("%f", eventNum.Id)
+        event.Type = eventNum.Type
+        event.Data = eventNum.Data
+        event.Reply = eventNum.Reply
+        event.Exception = eventNum.Exception
     }
-    if socket.Listener == nil {
-        return
-    }
+
     if event.Reply == nil || *event.Reply == false {
         if event.Type == "heartbeat" {
+            log.Println("Got heartbeat!")
             socket.setHeartbeatTimer()
-            socket.Send("heartbeat", nil, nil)
+            go socket.Send("heartbeat", "", nil)
         } else if event.Type == "reply" {
             socket.reply(event)
         } else {
-            socket.Listener.Messsage(event.Type, event.Data)
+            socket.Listener.Message(event.Type, event.Data)
         }
     } else {
         // This is how to implement `reply` extension. An event handler for
@@ -496,6 +594,7 @@ type transportInt interface {
     Close()
     SetListener(transportListener)
     Refresh(w http.ResponseWriter, req *http.Request, params url.Values)
+    Wait()
 }
 
 type transportListener interface {
@@ -515,18 +614,22 @@ type transportListener interface {
 // specified by W3C.
 type sseTransport struct {
     conn            net.Conn
-    connRW          *bufio.ReadWriter
-    chunkWriter     io.WriteCloser
+    connRW          http.Flusher//*bufio.ReadWriter
+    chunkWriter     http.ResponseWriter //io.WriteCloser
     listener        transportListener
+    writeQueue      chan []byte
+    closed          bool
+    closedLock      sync.Mutex
 }
 
 func newSseTransport(w http.ResponseWriter, req *http.Request, params url.Values) *sseTransport {
-    hj, ok := w.(http.Hijacker)
+    /*hj, ok := w.(http.Hijacker)
     if !ok {
         panic("cannot hijack request!")
         return nil
-    }
+    }*/
     sse := new(sseTransport)
+    sse.writeQueue = make(chan []byte)
     text2KB := make([]byte, 2048)
     for i := range text2KB {
         text2KB[i] = ' '
@@ -540,6 +643,7 @@ func newSseTransport(w http.ResponseWriter, req *http.Request, params url.Values
         transportType = "plain"
     }
     w.Header().Set("content-type", fmt.Sprintf("text/%s; charset=utf-8", transportType))
+    w.Header().Set("Connection", "keep-alive")
     w.WriteHeader(200)
 
     fl, ok := w.(http.Flusher)
@@ -547,23 +651,16 @@ func newSseTransport(w http.ResponseWriter, req *http.Request, params url.Values
         panic("cannot flush!")
     }
     fl.Flush()
-
-    // we have written the header, now hijack the connection
-    var err error
-    sse.conn, sse.connRW, err = hj.Hijack()
-    if err != nil {
-        panic(fmt.Sprintf("cannot hijack request! %v", err))
-        return nil
-    }
-    sse.chunkWriter = httputil.NewChunkedWriter(sse.connRW)
+    sse.connRW = fl
+    sse.chunkWriter = w
+    sse.closed = false
 
 
     // The padding is required, which makes the client-side transportInt be aware
     // of change of the response and the client-side socket fire open event.
     // It should be greater than 1KB, be composed of white space character and 
     // end with `\r`, `\n` or `\r\n`. It applies to `streamxdr`, `streamiframe`.
-    io.Copy(sse.chunkWriter, bytes.NewReader(text2KB))
-    io.Copy(sse.chunkWriter, bytes.NewReader([]byte("\n")))
+    io.Copy(sse.chunkWriter, strings.NewReader(string(text2KB) + "\n"))
     sse.connRW.Flush()
     return sse
 }
@@ -573,18 +670,12 @@ func (sse * sseTransport) Refresh(w http.ResponseWriter, req *http.Request, para
 }
 
 func (sse * sseTransport) Send(data []byte) {
-    // The response text should be formatted in the [event stream
-    // format](http://www.w3.org/TR/eventsource/#parsing-an-event-stream).
-    // This is specified in `sse` spec but the rest also accept that format
-    // for convenience. According to the format, data should be broken up by
-    // `\r`, `\n`, or `\r\n` but because data is JSON, it's not needed. So
-    // prepend 'data: ' and append `\n\n` to the data.
-    log.Println("Write", string(data))
-    defer sse.connRW.Flush()
-    _, err := io.Copy(sse.chunkWriter, strings.NewReader("data: " + string(data) + "\n\n"))
-    if err != nil && sse.listener != nil {
-        sse.listener.OnTransportError(err)
+    sse.closedLock.Lock()
+    defer sse.closedLock.Unlock()
+    if sse.closed {
+        return
     }
+    sse.writeQueue <- data
 }
 
 // Ends the response. Accordingly, `onclose` will be executed and the
@@ -592,24 +683,41 @@ func (sse * sseTransport) Send(data []byte) {
 func (sse *sseTransport) Close() {
     log.Println("Close SSE transportInt")
     sse.connRW.Flush()
-    if err := sse.chunkWriter.Close(); err != nil {
-        sse.listener.OnTransportError(err)
-    }
-    if err := sse.conn.Close(); err != nil {
-        sse.listener.OnTransportError(err)
-    }
+
+    sse.closedLock.Lock()
+    sse.closed = true
+    close(sse.writeQueue)
+    sse.closedLock.Unlock()
+
     sse.listener.OnTransportClose()
+
 }
 
 func (sse *sseTransport) SetListener(tl transportListener) {
     sse.listener = tl
 }
 
+func (sse *sseTransport) Wait() {
+    for {
+        msg, ok := <- sse.writeQueue
+        if !ok {
+            return
+        }
+        // The response text should be formatted in the [event stream
+        // format](http://www.w3.org/TR/eventsource/#parsing-an-event-stream).
+        // This is specified in `sse` spec but the rest also accept that format
+        // for convenience. According to the format, data should be broken up by
+        // `\r`, `\n`, or `\r\n` but because data is JSON, it's not needed. So
+        // prepend 'data: ' and append `\n\n` to the data.
+        log.Println("Write", string(msg))
+        fmt.Fprintf(sse.chunkWriter, "data: " + string(msg) + "\n\n")
+        sse.connRW.Flush()
+    }
+}
+
 type longpollAjax struct {
     // Whether the transportInt is aborted or not.
     aborted         bool
-    // Whether the current response is closed or not.
-    closed          bool
     // Whether data is written on the current response or not. if this is true,
     // then `closed` is also true but not vice versa.
     written         bool
@@ -622,14 +730,23 @@ type longpollAjax struct {
     callbackForLongPollJsonP    string
     whenParam           string
     contentType         string
-    // our connection
-    conn            net.Conn
-    connRW          *bufio.ReadWriter
-    chunkWriter     io.WriteCloser
+
     listener        transportListener
     doneClose       bool
 
     refreshLock     sync.Mutex
+
+    // our connection
+    curConnection       *longpollConnection
+
+}
+
+type longpollConnection struct {
+    writeQueue              chan []byte
+    flush                   http.Flusher
+    chunkWriter             http.ResponseWriter
+    closed                  bool
+    closeLock               sync.Mutex
 }
 
 func newLongPollAjax(w http.ResponseWriter, req *http.Request, params url.Values) *longpollAjax {
@@ -653,42 +770,87 @@ func (lp *longpollAjax) SetListener(tl transportListener) {
     lp.listener = tl
 }
 
+func (lp *longpollAjax) Wait() {
+    con := lp.curConnection
+    isFirst := true
+    autoClose := time.After(time.Second * 2)
+    defer func () {
+        if !isFirst {
+            if !lp.isLongpollJsonP {
+                fmt.Fprint(con.chunkWriter, "]")
+            }
+            con.flush.Flush()
+        }
+    }()
+    for {
+        var data []byte
+        var ok bool
+        select {
+            case data, ok = <- con.writeQueue:
+            case <- autoClose:
+                con.closeLock.Lock()
+                defer con.closeLock.Unlock()
+                con.closed = true
+                return
+        }
+        if !ok {
+            return
+        }
+        comma := ","
+        if isFirst {
+            if !lp.isLongpollJsonP {
+                fmt.Fprint(con.chunkWriter, "[")
+            }
+            isFirst = false
+            comma = ""
+        }
+        var err error
+        if lp.isLongpollJsonP {
+            buf := bytes.Buffer{}
+            buf.WriteString(lp.callbackForLongPollJsonP)
+            buf.WriteString("(")
+            dataM, _ := json.Marshal(string(data))
+            buf.Write(dataM)
+            buf.WriteString(");")
+            _, err = fmt.Fprint(con.chunkWriter, buf.String())
+        } else {
+            _, err = fmt.Fprintf(con.chunkWriter, "%s%s", comma, string(data))
+        }
+        if err != nil {
+            lp.listener.OnTransportError(err)
+        }
+        con.flush.Flush()
+    }
+}
 
 func (lp *longpollAjax) Refresh(w http.ResponseWriter, req *http.Request, params url.Values) {
     lp.refreshLock.Lock()
     defer lp.refreshLock.Unlock()
 
-    hj, ok := w.(http.Hijacker)
-    if !ok {
-        panic("cannot hijack request!")
-        return
-    }
-
     w.Header().Set("content-type", fmt.Sprintf("text/%s; charset=utf-8", lp.contentType))
     w.WriteHeader(200)
 
     // close any old connection
-    if lp.conn != nil {
-        lp.closeConnection(false)
+    if lp.curConnection != nil && lp.curConnection.closed == false{
+        close(lp.curConnection.writeQueue)
     }
 
     // we have written the header, now hijack the connection
-    var err error
-    lp.conn, lp.connRW, err = hj.Hijack()
-    if err != nil {
-        panic(fmt.Sprintf("cannot hijack request! %v", err))
-        return
+    lp.curConnection = &longpollConnection{
+        writeQueue: make(chan []byte),
+        flush: w.(http.Flusher),
+        chunkWriter: w,
     }
-    lp.chunkWriter = httputil.NewChunkedWriter(lp.connRW)
-    lp.doneClose = false
 
     // If the request is to `open`, end the response. The purpose of this is
     // to tell the client that the server is alive. Therefore, the client
     // will fire the open event.
     if params.Get("when") == "open" {
-        lp.closeConnection(false)
+        lp.curConnection.closeLock.Lock()
+        defer lp.curConnection.closeLock.Unlock()
+        lp.curConnection.closed = true
+        close(lp.curConnection.writeQueue)
     } else {
-        lp.closed = false
         lp.written = false
         if lp.closeTimer != nil {
             lp.closeTimer.Stop()
@@ -697,7 +859,7 @@ func (lp *longpollAjax) Refresh(w http.ResponseWriter, req *http.Request, params
         // connection but it couldn't be done because the current response
         // is already closed for other reason. So ends the new exchange.
         if lp.aborted {
-            lp.closeConnection(false)
+            lp.closeConnection()
             return
         }
 
@@ -727,11 +889,9 @@ func (lp *longpollAjax) Refresh(w http.ResponseWriter, req *http.Request, params
         }
 
         // If cached events remain in the queue, it indicates the client
-        // couldn't receive them. So flushes them in the form of JSON array.
-        // This is not the same with `JSON.stringify(queue)`
-        // because elements in queue are already JSON string.
-        if len(lp.queue) > 0 {
-            b, err := json.Marshal(lp.queue)
+        // couldn't receive them.
+        for i := range lp.queue {
+            b, err := json.Marshal(lp.queue[i])
             if err != nil {
                 lp.listener.OnTransportError(err)
             } else {
@@ -758,60 +918,37 @@ func (lp *longpollAjax) SendFromQ(data []byte, fromQueue bool) {
     // Only when the current response is not closed, it's possible to send.
     // If it is closed, the cached data will be sent in next poll through
     // `refresh` method.
-    if lp.closed {
+    lp.curConnection.closeLock.Lock()
+    defer lp.curConnection.closeLock.Unlock()
+    if lp.curConnection.closed {
         return
     }
     lp.written = true
-
-    var err error
-
-    defer lp.connRW.Flush()
-
-    if lp.isLongpollJsonP {
-        buf := bytes.Buffer{}
-        buf.WriteString(lp.callbackForLongPollJsonP)
-        buf.WriteString("(")
-        dataM, _ := json.Marshal(string(data))
-        buf.Write(dataM)
-        buf.WriteString(");")
-        _, err = io.Copy(lp.chunkWriter, bytes.NewReader([]byte(buf.String())))
-    } else {
-        _, err = io.Copy(lp.chunkWriter, bytes.NewReader(data))
-    }
-    if err != nil {
-        lp.listener.OnTransportError(err)
-    }
-    lp.closed = true
-    defer lp.conn.Close()
-    defer lp.connRW.Flush()
+    lp.curConnection.writeQueue <- data
 }
 
 func (lp *longpollAjax) Close() {
     lp.aborted = true
-    if !lp.closed {
-        lp.closeConnection(true)
+    if !lp.doneClose {
+        lp.closeConnection()
     }
 }
 
-func (lp *longpollAjax) closeConnection(doAlert bool) {
-    if lp.closed == false {
-        err := lp.conn.Close()
-        if err != nil {
-            lp.listener.OnTransportError(err)
-        }
+func (lp *longpollAjax) closeConnection() {
+    lp.curConnection.closeLock.Lock()
+    defer lp.curConnection.closeLock.Unlock()
+    if lp.curConnection.closed == false {
+
+        lp.curConnection.closed = true
+        close(lp.curConnection.writeQueue)
     }
     if lp.doneClose == true {
         return
     }
     lp.doneClose = true
-    // The current exchange's life ends but this has nothing to do with
-    // `written`.
-    lp.closed = true
 
     if lp.whenParam == "poll" && !lp.written {
-        if doAlert {
-            lp.listener.OnTransportClose()
-        }
+        lp.listener.OnTransportClose()
     } else {
         // Otherwise client will issue `poll` request again so it sets a
         // timer to fire close event to prevent this connection from
