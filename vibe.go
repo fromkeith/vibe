@@ -24,7 +24,6 @@ import (
     "strconv"
     "net"
     "fmt"
-    "log"
     "errors"
     "sync"
     "github.com/gorilla/websocket"
@@ -67,6 +66,9 @@ type ServerListener interface {
 
     // authorizes the request. Return false to deny the request.
     Auth(req *http.Request) bool
+
+    // used for logging
+    Log(format string, args... interface{})
 }
 
 type SocketListener interface {
@@ -174,6 +176,13 @@ func (serv *Server) IsSocketAlive(id string) bool {
 }
 
 func (serv *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+    defer func () {
+        rec := recover()
+        if rec != nil {
+            serv.Listener.Log("Paniced: %v", rec)
+            http.Error(w, "ServerError", 500)
+        }
+    }()
     // Any request must not be cached.
     w.Header().Set("cache-control", "no-cache, no-store, must-revalidate")
     w.Header().Set("pragma", "no-cache")
@@ -194,7 +203,7 @@ func (serv *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
         return
     }
 
-    log.Println("vibe.Server.ServeHttp: ", req.Method, ":", req.URL.RequestURI())
+    serv.Listener.Log("vibe.Server.ServeHttp: %s : %s", req.Method, req.URL.RequestURI())
 
     switch strings.ToUpper(req.Method) {
         case "GET":
@@ -264,7 +273,6 @@ func (serv *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
                 case "abort":
                     defer req.Body.Close()
                     if s, ok := serv.sockets[params.Get("id")]; ok {
-                        log.Println("Abort requested")
                         s.Close()
                     }
                     // In case of browser, it is performed by script tag so set
@@ -486,7 +494,6 @@ type messageWithNumberId struct {
 
 func (socket *VibeSocket) OnTransportMessage(msg string) {
     // Converts JSON to an message object.
-    log.Println("OnMessage:", msg)
     var event Message
     err := json.Unmarshal([]byte(msg), &event)
     if err != nil {
@@ -504,7 +511,6 @@ func (socket *VibeSocket) OnTransportMessage(msg string) {
 
     if event.Reply == nil || *event.Reply == false {
         if event.Type == "heartbeat" {
-            log.Println("Got heartbeat!")
             socket.setHeartbeatTimer()
             go socket.Send("heartbeat", "", nil)
         } else if event.Type == "reply" {
@@ -537,9 +543,7 @@ func (socket *VibeSocket) reply(event Message) {
     asB, _ := json.Marshal(event.Data)
     var replyTo Message
     json.Unmarshal(asB, &replyTo)
-    log.Println("reply")
     for k, v := range socket.callbacks {
-        log.Println("isReply:", k, replyTo.Id)
         if replyTo.Id == k {
             resolved := replyTo.Exception == nil || !*replyTo.Exception
             v(resolved, replyTo.Data)
@@ -688,7 +692,6 @@ func (sse * sseTransport) Send(data []byte) {
 // Ends the response. Accordingly, `onclose` will be executed and the
 // `finish` event will be fired. Don't do that by yourself.
 func (sse *sseTransport) Close() {
-    log.Println("Close SSE transportInt")
     sse.connRW.Flush()
 
     sse.closedLock.Lock()
@@ -716,7 +719,6 @@ func (sse *sseTransport) Wait() {
         // for convenience. According to the format, data should be broken up by
         // `\r`, `\n`, or `\r\n` but because data is JSON, it's not needed. So
         // prepend 'data: ' and append `\n\n` to the data.
-        log.Println("Write", string(msg))
         fmt.Fprintf(sse.chunkWriter, "data: " + string(msg) + "\n\n")
         sse.connRW.Flush()
     }
