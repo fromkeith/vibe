@@ -485,7 +485,7 @@ type Message struct {
 
 // default vibe client sends Id as number... thats annoying.
 type messageWithNumberId struct {
-    Id              float64     `json:"id"`
+    Id              int64     `json:"id"`
     Type            string      `json:"type"`
     Data            interface{} `json:"data,omitempty"`
     Reply           *bool       `json:"reply,omitempty"`
@@ -502,7 +502,7 @@ func (socket *VibeSocket) OnTransportMessage(msg string) {
             socket.Listener.Error(err)
             return
         }
-        event.Id = fmt.Sprintf("%f", eventNum.Id)
+        event.Id = fmt.Sprintf("%d", eventNum.Id)
         event.Type = eventNum.Type
         event.Data = eventNum.Data
         event.Reply = eventNum.Reply
