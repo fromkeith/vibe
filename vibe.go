@@ -61,11 +61,14 @@ var (
 
 // A listener for the whole server
 type ServerListener interface {
-    // Socket gets called when a new socket has been opened
-    Socket(s *VibeSocket)
+    // Socket gets called when a new socket has been opened. The request is
+    // the one opening the socket. This can be used to associate authentication
+    // data with an open socket.
+    Socket(s *VibeSocket, req*http.Request)
 
     // authorizes the request. Return false to deny the request.
-    Auth(req *http.Request) bool
+    // a vibesocket will be provided if it is an socket being manipulated
+    Auth(req *http.Request, s*VibeSocket) bool
 
     // used for logging
     Log(format string, args... interface{})
@@ -89,7 +92,7 @@ type Server struct {
     // The listener to get events
     Listener        ServerListener
     sockets         map[string]*VibeSocket
-    socketMapLock   sync.Mutex
+    socketMapLock   sync.RWMutex
 }
 
 // Represents a single client connect to the Server
@@ -171,8 +174,21 @@ func (serv *Server) SetHeartbeat(t time.Duration) {
 }
 
 func (serv *Server) IsSocketAlive(id string) bool {
-    _, ok := serv.sockets[id]
+    _, ok := serv.getSocket(id)
     return ok
+}
+
+func (serv *Server) getSocket(id string) (*VibeSocket, bool) {
+    serv.socketMapLock.RLock()
+    defer serv.socketMapLock.RUnlock()
+    v, ok := serv.sockets[id]
+    return v, ok
+}
+
+func (serv *Server) setSocket(id string, v *VibeSocket) {
+    serv.socketMapLock.Lock()
+    defer serv.socketMapLock.Unlock()
+    serv.sockets[id] = v
 }
 
 func (serv *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -198,12 +214,9 @@ func (serv *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 
     params := req.URL.Query()
 
-    if !serv.Listener.Auth(req) {
-        http.Error(w, "Not Authorized", 403)
-        return
-    }
-
     serv.Listener.Log("vibe.Server.ServeHttp: %s : %s", req.Method, req.URL.RequestURI())
+
+    defer req.Body.Close()
 
     switch strings.ToUpper(req.Method) {
         case "GET":
@@ -211,7 +224,10 @@ func (serv *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
                 // Negotiates the protocol. Information to connect to the
                 // server are passed to the client.
                 case "handshake":
-                    defer req.Body.Close()
+                    if !serv.Listener.Auth(req, nil) {
+                        http.Error(w, "Not Authorized", 403)
+                        return
+                    }
                     // A result of handshaking is a JSON containing that
                     // information.
                     res := handshakeResult{
@@ -237,7 +253,10 @@ func (serv *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
                 // `socket` event. `transportInt` param is an id of transportInt the
                 // client uses.
                 case "open":
-                    defer req.Body.Close()
+                    if !serv.Listener.Auth(req, nil) {
+                        http.Error(w, "Not Authorized", 403)
+                        return
+                    }
                     // If the server doesn't support the required transportInt,
                     // responds with `501 Not Implemented`. However, it's 
                     // unlikely to happen.
@@ -248,7 +267,7 @@ func (serv *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
                     s := serv.socket(serv, params, serv.createTransport(w, req, params))
                     //s.Uri = req.URL
                     if serv.Listener != nil {
-                        serv.Listener.Socket(s)
+                        serv.Listener.Socket(s, req)
                     }
                     s.transport.Wait()
                     break
@@ -257,8 +276,11 @@ func (serv *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
                 // a pseudo-connection consisting of disposable exchanges pretends
                 // to be a persistent connection.
                 case "poll":
-                    defer req.Body.Close()
-                    if s, ok := serv.sockets[params.Get("id")]; ok {
+                    if s, ok := serv.getSocket(params.Get("id")); ok {
+                        if !serv.Listener.Auth(req, s) {
+                            http.Error(w, "Not Authorized", 403)
+                            return
+                        }
                         s.transport.Refresh(w, req, params)
                         s.transport.Wait()
                     } else {
@@ -271,8 +293,11 @@ func (serv *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
                 // as closed so abort the socket if the server couldn't detect it
                 // for some reason.
                 case "abort":
-                    defer req.Body.Close()
-                    if s, ok := serv.sockets[params.Get("id")]; ok {
+                    if s, ok := serv.getSocket(params.Get("id")); ok {
+                        if !serv.Listener.Auth(req, s) {
+                            http.Error(w, "Not Authorized", 403)
+                            return
+                        }
                         s.Close()
                     }
                     // In case of browser, it is performed by script tag so set
@@ -284,14 +309,23 @@ func (serv *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
                 // If the given `when` param is unsupported, responds with `501 Not
                 // Implemented`.
                 default:
-                    defer req.Body.Close()
                     w.WriteHeader(501)
             }
             break
         // `POST` method is used to supply HTTP transportInt with message as a
         // channel for the client to push something to the server.
         case "POST":
-            defer req.Body.Close()
+            s, ok := serv.getSocket(params.Get("id"))
+            if !ok {
+                // If the specified socket is not found,
+                // responds with `500 Internal Server Error`.
+                w.WriteHeader(500)
+                return
+            }
+            if !serv.Listener.Auth(req, s) {
+                http.Error(w, "Not Authorized", 403)
+                return
+            }
             // Reads body to retrieve message. Only text data is allowed now.
             buf := bytes.Buffer{}
             if _, err := io.Copy(&buf, req.Body); err != nil {
@@ -301,22 +335,12 @@ func (serv *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
             text := strings.TrimPrefix(buf.String(), "data=")
             // Fires a message event to the socket's transportInt
             // whose id is `id` param with that text message.
-            serv.socketMapLock.Lock()
-            s, ok := serv.sockets[params.Get("id")]
-            serv.socketMapLock.Unlock()
-            if ok {
-                s.OnTransportMessage(text)
-                w.WriteHeader(200)
-            } else {
-                // If the specified socket is not found,
-                // responds with `500 Internal Server Error`.
-                w.WriteHeader(500)
-            }
+            s.OnTransportMessage(text)
+            w.WriteHeader(200)
             break
         // If the method is neither `GET` nor `POST`, responds with `405 Method
         // Not Allowed`.
         default:
-            defer req.Body.Close()
             w.WriteHeader(405)
             break
     }
@@ -445,10 +469,7 @@ func (serv *Server) socket(server *Server, params url.Values, t transportInt) *V
 
     socket.callbacks = make(map[string]SocketCallback)
 
-    serv.socketMapLock.Lock()
-    serv.sockets[socket.Id] = socket
-    serv.socketMapLock.Unlock()
-
+    serv.setSocket(socket.Id, socket)
     return socket
 }
 
