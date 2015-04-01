@@ -309,6 +309,19 @@ func (serv *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
                 // If the given `when` param is unsupported, responds with `501 Not
                 // Implemented`.
                 default:
+                    if req.Header.Get("Upgrade") == "websocket" {
+                        if !serv.Listener.Auth(req, nil) {
+                            http.Error(w, "Not Authorized", 403)
+                            return
+                        }
+                        s := serv.socket(serv, params, newWebsocketTransport(w, req, params))
+                        //s.Uri = req.URL
+                        if serv.Listener != nil {
+                            serv.Listener.Socket(s, req)
+                        }
+                        s.transport.Wait()
+                        break
+                    }
                     w.WriteHeader(501)
             }
             break
@@ -461,15 +474,25 @@ func (w *websocketTransport) Wait() {
 func (serv *Server) socket(server *Server, params url.Values, t transportInt) *VibeSocket {
     socket := new(VibeSocket)
     socket.Id = params.Get("id")
+    // if they aren't taking an existing, create a new one
+    if socket.Id == "" {
+        socket.Id = uuid.New()
+    }
     socket.transport = t
     socket.Server = server
-
-    t.SetListener(socket)
-    socket.setHeartbeatTimer()
 
     socket.callbacks = make(map[string]SocketCallback)
 
     serv.setSocket(socket.Id, socket)
+
+    // cettia requires our first message be part of handshake.
+    // we must return our options via an URI encoded message.
+    go func () {
+        t.Send([]byte(fmt.Sprintf("?heartbeat=%d\n", server.heartbeat)))
+        t.SetListener(socket)
+        socket.setHeartbeatTimer()
+    }()
+
     return socket
 }
 
@@ -536,7 +559,7 @@ func (socket *VibeSocket) OnTransportMessage(msg string) {
             go socket.Send("heartbeat", "", nil)
         } else if event.Type == "reply" {
             socket.reply(event)
-        } else {
+        } else if socket.Listener != nil {
             socket.Listener.Message(event.Type, event.Data)
         }
     } else {
